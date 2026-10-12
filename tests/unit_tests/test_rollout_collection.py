@@ -7808,6 +7808,25 @@ class TestAgentMapRouting:
         rows = RolloutCollectionHelper._preprocess_rows_from_config(None, self._config(tmp_path, fpath))
         assert rows[0]["agent_ref"]["name"] == "x"
 
+    def test_agent_name_matching_row_keeps_agent_ref_dict(self, tmp_path) -> None:
+        """`gym eval run --agent X` on rows already routed to X must not strip extra agent_ref fields."""
+        row = self._rcp_row()
+        row["agent_ref"] = {"type": "responses_api_agents", "name": "x"}
+        config = self._config(tmp_path, self._write_rows(tmp_path, [row]), agent_name="x")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            rows = RolloutCollectionHelper._preprocess_rows_from_config(None, config)
+        assert rows[0]["agent_ref"] == {"type": "responses_api_agents", "name": "x"}
+
+    def test_agent_name_reroute_restamps_clean_agent_ref(self, tmp_path) -> None:
+        """A real re-route replaces agent_ref outright; the old agent's extra fields don't carry over."""
+        row = self._rcp_row()
+        row["agent_ref"] = {"type": "responses_api_agents", "name": "old_agent"}
+        config = self._config(tmp_path, self._write_rows(tmp_path, [row]), agent_name="new_agent")
+        with pytest.warns(UserWarning, match="overrode agent_ref"):
+            rows = RolloutCollectionHelper._preprocess_rows_from_config(None, config)
+        assert rows[0]["agent_ref"] == {"name": "new_agent"}
+
     def test_missing_agent_still_hard_errors(self, tmp_path) -> None:
         fpath = self._write_rows(tmp_path, [self._rcp_row()])
         config = self._config(tmp_path, fpath, agent_map={"x": "y"})
