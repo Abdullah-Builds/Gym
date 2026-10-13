@@ -90,6 +90,12 @@ when the executable is a node script, is put on the agent's `PATH`. The agent's
 Private task images can pass registry credentials through
 `sandbox_spec.provider_options.image_auth`.
 
+With the Apptainer provider, anyswe always adds `--no-home` to
+`create.extra_start_args`. Apptainer would otherwise bind the Gym server's home
+(`/root` when the server runs as root) over the task image's `/root` in every
+sandbox, hiding toolchains that images keep there, such as R2E-Gym's
+`/root/.local/share/uv` interpreters.
+
 ## Reward
 
 SWE-bench and SWE-bench Multilingual use the official `make_test_spec` and
