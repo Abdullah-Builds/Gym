@@ -75,27 +75,39 @@ python scripts/run_harness_conformance.py \
 ```
 
 Run from a Gym checkout with Gym and the selected agents' Python requirements
-installed. Put the selected `codex`, `pi`, and `opencode` executables on `PATH`;
-Hermes must be importable in the same Python environment. The versions pinned in
-`responses_api_agents/*/configs/` are the recommended starting point. The runner
-requires installed runtimes; missing dependencies are execution failures.
+installed. Probes using agent sessions require Linux and install the adapter's
+pinned runtime during session setup, using Gym's local subprocess sandbox provider.
+Legacy probes require the selected `codex`, `pi`, and `opencode` executables on
+`PATH`; Hermes must be importable in the same Python environment. Missing
+dependencies or unsuccessful runtime installation are execution failures.
 Omitting `--harness` selects all four.
 
 No model service or model credentials are needed. Each scenario starts fresh
 local model, resources, agent, and compatibility environment servers on dynamically assigned loopback ports.
-The existing Gym adapter runs its real harness and normal seed/verify lifecycle;
+The runner prefers the agent session interface whenever the adapter implements
+session setup and close, including inherited implementations. It uses
+`single_agent_turn_legacy` to translate the probe's flat rows into Resources seed,
+Agent seed, correlated `/v1/responses`, Agent close, verification, and Resources
+close. The agent owns its local workspace because verification only reads retained
+output. An adapter with unimplemented session handlers uses `legacy_agent`, which
+relays to the agent's `/run`. Setup, execution, or cleanup failures during an agent
+session never trigger legacy fallback. Migrating an adapter to the shared session
+contract automatically switches its probes without changing the runner.
+
+The existing Gym adapter runs its real harness and normal lifecycle;
 `RolloutCollectionHelper` produces the rollout and capture payloads. The runner
 never supplies canonical steps, joins, or tool observations on the harness's
 behalf. All implementation remains under `scripts/` for eventual CI integration.
 
-The OpenCode preset disables its auxiliary title and summary agents through
+The legacy OpenCode preset disables its auxiliary title and summary agents through
 [agent configuration](https://opencode.ai/docs/agents/#disable), so scripted
 failures reach policy requests. This configuration is saved with the run.
 
 The suite uses each harness's local shell tool to print a unique marker, write it
 inside the output directory, and return a prescribed exit code. Local execution
 must be allowed (the Codex preset uses `danger-full-access` in a fresh working
-directory). These probes qualify the local adapter path; they do not exercise a
+directory). During an agent session, the subprocess sandbox provider uses the same
+local filesystem. These probes qualify the local adapter path; they do not exercise a
 remote sandbox deployment.
 
 ## Scenarios
@@ -136,8 +148,9 @@ rejected, so previous rollouts cannot accidentally qualify a new run.
 - `suite.json`: selected scenarios and runner source hashes.
 - `<harness>/<scenario>/requests.jsonl`, `launch.json`, and `episode.log`: input,
   resolved launch configuration, and process diagnostics.
-- `<harness>/<scenario>/runtime.json`: executable version or Hermes source hash,
-  plus the Gym adapter source hash.
+- `<harness>/<scenario>/runtime.json`: selected agent interface, version pins for
+  agent session runtimes or legacy executable version/Hermes source hash, plus the
+  Gym adapter source hash.
 - `<harness>/<scenario>/rollouts.jsonl` and `capture/`: ordinary Gym outputs,
   directly consumable by `scripts/inspect_harness_conformance.py`.
 - `<harness>/<scenario>/witness.json`: independent endpoint attempts, actual tool
