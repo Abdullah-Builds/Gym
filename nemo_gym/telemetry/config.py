@@ -87,6 +87,16 @@ class TelemetryConfig(BaseModel, extra="allow"):
     memory_profiling: MemoryProfilingConfig = Field(default_factory=MemoryProfilingConfig)
     """Sample each Gym-managed server process tree and emit memory metrics."""
 
+    event_loop_sample_interval_seconds: float = Field(default=1.0, gt=0)
+    """Seconds between samples of each process's event-loop lag, when metrics are on."""
+
+    event_loop_task_count: bool = False
+    """Also report how many asyncio tasks exist on each event loop, at every sample.
+
+    Off by default because counting tasks walks every task on the loop while holding it.
+    That takes about a millisecond per sample at 16,000 tasks, which a driver at high concurrency can reach.
+    """
+
     logs_enabled: bool = False
     """Bridge Python logging to OTel logs, exported with trace correlation."""
 

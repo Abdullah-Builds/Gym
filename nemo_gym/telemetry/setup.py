@@ -108,6 +108,11 @@ _ENV_FIELD_MAP = {
 #: Exporting one of them as ``NEMO_GYM_OTEL_<KEY>`` would shadow that fallback.
 _LENS_FIELDS = frozenset({"span_groups", "traces_enabled", "metrics_enabled", "logs_enabled", "exporter", "run_id"})
 
+_EVENT_LOOP_ENV_FIELD_MAP = {
+    "event_loop_sample_interval_seconds": f"{_OTEL_PREFIX}_EVENT_LOOP_SAMPLE_INTERVAL_SECONDS",
+    "event_loop_task_count": f"{_OTEL_PREFIX}_EVENT_LOOP_TASK_COUNT",
+}
+
 _MEMORY_PROFILING_ENV_FIELD_MAP = {
     "enabled": f"{_OTEL_PREFIX}_MEMORY_PROFILING_ENABLED",
     "interval_seconds": f"{_OTEL_PREFIX}_MEMORY_PROFILING_INTERVAL_SECONDS",
@@ -177,6 +182,20 @@ def memory_profiling_config_from_env(defaults: MemoryProfilingConfig) -> MemoryP
             "interval_seconds": os.environ.get(interval_env, defaults.interval_seconds),
         }
     )
+
+
+def event_loop_settings_from_env() -> tuple[float, bool]:
+    """Return the event-loop sample interval and whether to count tasks, from the environment the supervisor exported."""
+    defaults = TelemetryConfig()
+    interval = float(
+        os.environ.get(
+            _EVENT_LOOP_ENV_FIELD_MAP["event_loop_sample_interval_seconds"], defaults.event_loop_sample_interval_seconds
+        )
+    )
+    if interval <= 0:
+        interval = defaults.event_loop_sample_interval_seconds
+    task_count = _env_flag(_EVENT_LOOP_ENV_FIELD_MAP["event_loop_task_count"], defaults.event_loop_task_count)
+    return interval, task_count
 
 
 def telemetry_config_from_global_config(global_config_dict: Any) -> TelemetryConfig:
@@ -252,6 +271,10 @@ def configure_telemetry_env(telemetry_config: Union[TelemetryConfig, None]) -> O
 
     for field, env_name in _MEMORY_PROFILING_ENV_FIELD_MAP.items():
         value = getattr(telemetry_config.memory_profiling, field)
+        os.environ.setdefault(env_name, "1" if value is True else "0" if value is False else str(value))
+
+    for field, env_name in _EVENT_LOOP_ENV_FIELD_MAP.items():
+        value = getattr(telemetry_config, field)
         os.environ.setdefault(env_name, "1" if value is True else "0" if value is False else str(value))
 
     for field, env_name in _OTLP_ENV_FIELD_MAP.items():
@@ -373,6 +396,8 @@ def _build_resource_attributes(server_name: Optional[str], server_type: Optional
         attrs["nemo.gym.server.name"] = server_name
     if server_type:
         attrs["nemo.gym.server.type"] = server_type
+    # The Uvicorn workers of one server share its name and type, so the process ID is what tells their metrics apart.
+    attrs["process.pid"] = os.getpid()
     return attrs
 
 

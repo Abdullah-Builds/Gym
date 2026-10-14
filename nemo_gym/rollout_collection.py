@@ -31,6 +31,7 @@ from datetime import timedelta
 from difflib import get_close_matches
 from itertools import repeat
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Callable, Dict, Iterator, List, Literal, Optional, Tuple, Union
 
 import orjson
@@ -105,6 +106,7 @@ from nemo_gym.telemetry.gym_metrics import (
     record_rollout_completed,
     record_rollout_health,
 )
+from nemo_gym.telemetry.observer import MeteredAdmission, count_resident, driver_metrics, observe_event_loop
 from nemo_gym.telemetry.setup import is_metrics_exporter_active
 from nemo_gym.telemetry.span_groups import GymSpanGroup
 
@@ -1307,6 +1309,42 @@ class DispatchLatencyTracker:
                 "These wrote no row and will be re-dispatched on resume."
             )
         return "\n".join(lines)
+
+
+def _record_output_write(started: float, serialized: bytes) -> None:
+    """Record how long one output row took to write and how large it was, while metrics are exporting."""
+    observer = driver_metrics()
+    if observer is not None:
+        observer.write_duration.record((perf_counter() - started) * 1000.0)
+        observer.write_bytes.record(len(serialized) + 1)
+
+
+def _record_rollout_shape(row: Mapping[str, Any], result: Mapping[str, Any]) -> None:
+    """Record the size of one completed rollout, while metrics are exporting.
+
+    Turns and tool calls come from the rollout's ``ng_perf`` when rollout observability produced it.
+    Without it, tool calls are counted from the final response's ``function_call`` items, and turns are not recorded.
+    """
+    observer = driver_metrics()
+    if observer is None:
+        return
+    try:
+        input_items = (row.get("responses_create_params") or {}).get("input")
+        if isinstance(input_items, list):
+            observer.input_items.record(len(input_items))
+        output_items = ((result.get("response") or {}).get("output")) or []
+        observer.output_items.record(len(output_items))
+        ng_perf = result.get(NG_PERF_KEY) or {}
+        if "num_turns" in ng_perf:
+            observer.turns.record(ng_perf["num_turns"])
+        tool_calls = ng_perf.get("num_tool_calls")
+        if tool_calls is None:
+            tool_calls = sum(
+                1 for item in output_items if isinstance(item, dict) and item.get("type") == "function_call"
+            )
+        observer.tool_calls.record(tool_calls)
+    except Exception:
+        logger.debug("Could not record rollout shape metrics", exc_info=True)
 
 
 def _dispatch_drained_result(remaining_s: float, margin_s: Optional[float]) -> Dict[str, Any]:
@@ -2594,10 +2632,11 @@ class RolloutCollectionHelper(BaseModel):
         preset but deliberately not in `per_rollout`, where each rollout is meant to be
         its own bounded root trace.
         """
-        if not is_span_group_enabled(GymSpanGroup.JOB):
-            return await self._run_from_config(config)
-        with managed_span(GymSpanGroup.JOB, "gym.job"):
-            return await self._run_from_config(config)
+        async with observe_event_loop("driver"):
+            if not is_span_group_enabled(GymSpanGroup.JOB):
+                return await self._run_from_config(config)
+            with managed_span(GymSpanGroup.JOB, "gym.job"):
+                return await self._run_from_config(config)
 
     async def _run_from_config(self, config: RolloutCollectionConfig) -> Tuple[List[Dict]]:
         output_fpath = Path(config.output_jsonl_fpath)
@@ -2652,6 +2691,7 @@ class RolloutCollectionHelper(BaseModel):
             persisted_rows: List[Dict] = []
             persisted_results: List[Dict] = []
 
+            materialize_started = perf_counter()
             input_rows = self._preprocess_rows_from_config(config)
             # Returned rows are sorted by (r[TASK_INDEX_KEY_NAME], r[ROLLOUT_INDEX_KEY_NAME])
 
@@ -2691,6 +2731,9 @@ class RolloutCollectionHelper(BaseModel):
             with config.materialized_jsonl_fpath.open("wb") as f:
                 for row in tqdm(input_rows, desc="Writing materialized rows"):
                     f.write(orjson.dumps(row) + b"\n")
+            observer = driver_metrics()
+            if observer is not None:
+                observer.materialize.record((perf_counter() - materialize_started) * 1000.0)
             output_fpath.unlink(missing_ok=True)
             # A fresh run must not inherit retry attempts or published metrics
             # from an older run that used the same output path.
@@ -2991,6 +3034,7 @@ class RolloutCollectionHelper(BaseModel):
                         f"row={json.dumps(_rollout_request_debug_summary(row), sort_keys=True)} "
                         f"class={failure_class} error={detail}"
                     )
+                    write_started = perf_counter()
                     failures_file.write(serialized + b"\n")
                     failures_file.flush()
                     _record_rollout_outcome(result, "failed", dispatch_name)
@@ -3000,14 +3044,18 @@ class RolloutCollectionHelper(BaseModel):
                         and (NG_AGENT_OBSERVATIONS_KEY in result or NG_TRAJECTORY_KEY in result)
                     ):
                         health_outcome = "failed"
+                    _record_output_write(write_started, serialized)
                     if batch_tracker is not None:
                         batch_failure_rows.append(_batch_status_row(result, batch_agent_refs))
                 else:
                     # Success → main jsonl.
+                    write_started = perf_counter()
                     results_file.write(serialized + b"\n")
                     results_file.flush()
                     _record_rollout_outcome(result, "scored", dispatch_name)
                     health_outcome = "scored"
+                    _record_output_write(write_started, serialized)
+                    _record_rollout_shape(row, result)
                     persisted_count += 1
                     persisted_success_keys.add((result[TASK_INDEX_KEY_NAME], result[ROLLOUT_INDEX_KEY_NAME]))
                     if config.retain_results_in_memory:
@@ -3751,6 +3799,10 @@ Aggregate metrics: {aggregate_metrics_fpath}{coverage}""")
             if isinstance(block, DictConfig) and isinstance(block.get(ENVIRONMENT_SERVER_TYPE_KEY_NAME), DictConfig)
         }
         semaphore = semaphore or nullcontext()
+        observer = driver_metrics()
+        if observer is not None:
+            semaphore = MeteredAdmission(semaphore, observer)
+            observer.driver.offered += len(examples)
         tracker = latency_tracker if latency_tracker is not None else DispatchLatencyTracker()
         # `is not None`, not truthiness: 0.0 is a real budget that is already
         # spent, and must drain rather than disable the check.
@@ -3831,6 +3883,8 @@ Aggregate metrics: {aggregate_metrics_fpath}{coverage}""")
                         tracker.record_failure(elapsed)
 
         awaitables = map(_post_subroutine, examples)
+        if observer is not None:
+            awaitables = (count_resident(awaitable, observer) for awaitable in awaitables)
         if max_resident_tasks is not None:
             return _BoundedCompletionIterator(
                 awaitables,
