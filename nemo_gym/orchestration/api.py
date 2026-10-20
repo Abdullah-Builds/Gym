@@ -519,6 +519,8 @@ class OtelConfig(_StrictModel):
     gym_span_groups: str = "default,verify"
     # Ship Gym's Python logging as OTel logs too (trace-correlated), through the same collector.
     gym_logs: bool = True
+    # One vLLM span per request (queue, prefill, decode, tokens) into the rollout trace; needs the OTel SDK in the image.
+    vllm_traces: bool = False
     # Node-level exporters that clusters commonly run as system services on every compute node;
     # scraped on localhost when set, skipped when null. DCGM gives per-GPU activity/memory/power,
     # node_exporter gives CPU/memory/network/disk. A closed port only logs scrape errors.
