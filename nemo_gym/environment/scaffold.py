@@ -57,11 +57,21 @@ class ScaffoldResult:
 
 
 @dataclass(frozen=True)
+class _ReusedEnvironmentServer:
+    """The environment server a reused config puts in front of its bundled agent."""
+
+    instance: str
+    implementation: str
+    agent_fields: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class _ReusedVerifier:
     selector: str
     config_reference: str
     resource_instance: str
     agent_instance: str | None
+    environment_server: _ReusedEnvironmentServer | None
 
 
 @dataclass(frozen=True)
@@ -75,6 +85,7 @@ class _Composition:
     resource_instance: str
     agent_implementation: str
     agent_instance: str
+    environment_instance: str
     dataset: ManifestDataset
     reward: Reward
     config_reference: str
@@ -207,10 +218,19 @@ def _composition(
         IntegrationProfile.EXTERNAL_AGENT_LOOP,
     }
     agent_implementation = f"{module_name}_agent" if custom_agent else "simple_agent"
+    reused_server = reused.environment_server if reused else None
+    reused_instances = {reused.resource_instance, reused.agent_instance} if reused else set()
+    if reused_server:
+        reused_instances.add(reused_server.instance)
     agent_instance = f"{module_name}_agent"
-    if reused and agent_instance in {reused.resource_instance, reused.agent_instance}:
+    if agent_instance in reused_instances:
         agent_instance = f"{module_name}_catalog_agent"
-    if reused and agent_instance in {reused.resource_instance, reused.agent_instance}:
+    # The workload inherits the reused server under its own name, never in place: another workload reusing the
+    # same scorer in one run would otherwise retire that shared name and leave this agent without a server.
+    environment_instance = f"{module_name}_environment_server"
+    if environment_instance in reused_instances:
+        environment_instance = f"{module_name}_catalog_environment_server"
+    if {agent_instance, environment_instance} & reused_instances:
         raise ScaffoldError(f"name {name!r} collides with instances in reused verifier {reused.selector!r}")
 
     base_path = f"{parent_name}/{name}"
@@ -241,6 +261,7 @@ def _composition(
         resource_instance=resource_instance,
         agent_implementation=agent_implementation,
         agent_instance=agent_instance,
+        environment_instance=environment_instance,
         dataset=dataset,
         reward=reward,
         config_reference=(
@@ -277,11 +298,21 @@ def _manifest(composition: _Composition) -> EnvironmentManifest:
 
 
 def _asset_config(composition: _Composition) -> str:
+    # Datasets are declared on the resources server (which defines what the rows mean and how
+    # they are scored), never on the agent — the agent is a run-time choice. The scaffolded
+    # config has exactly one agent referencing the resources server, so benchmark datasets
+    # resolve their harness from that edge; the dataset-level `agent:` key stays reserved for
+    # genuinely ambiguous configs.
+    dataset_dict = composition.dataset.model_dump(mode="json", exclude_none=True)
     agent_config: dict[str, Any] = {
         "resources_server": {"type": "resources_servers", "name": composition.resource_instance},
         "model_server": {"type": "responses_api_models", "name": "policy_model"},
-        "datasets": [composition.dataset.model_dump(mode="json", exclude_none=True)],
     }
+    # When reusing a verifier from another config we do not know its inner implementation key, so
+    # a partial resources-server override could not be merged safely; the dataset stays on the
+    # agent block there (still supported).
+    if composition.reused_verifier is not None:
+        agent_config["datasets"] = [dataset_dict]
     reused_agent = composition.reused_verifier.agent_instance if composition.reused_verifier else None
     if reused_agent:
         agent_entry: dict[str, Any] = {
@@ -296,6 +327,36 @@ def _asset_config(composition: _Composition) -> str:
         "config_paths": [composition.config_reference],
         composition.agent_instance: agent_entry,
     }
+    if composition.reused_verifier is None:
+        config[composition.resource_instance] = {
+            "resources_servers": {composition.resource_implementation: {"datasets": [dataset_dict]}}
+        }
+    # Rollout collection dispatches to environment servers, so the agent needs exactly one in front of it.
+    reused_server = composition.reused_verifier.environment_server if composition.reused_verifier else None
+    if reused_server is not None:
+        # The reused config already fronts the agent that `_inherit_from` moves to a new name above. Move
+        # its environment server the same way and point it at the new name, as the benchmark configs that
+        # reuse a scorer do. A fresh server beside it would leave the inherited one naming a deleted agent.
+        environment_entry: dict[str, Any] = {
+            "_inherit_from": reused_server.instance,
+            "environment_servers": {
+                reused_server.implementation: {
+                    field: {"name": composition.agent_instance} for field in reused_server.agent_fields
+                }
+            },
+        }
+    else:
+        # NOTE(martas): for now this builds the legacy config structure
+        # should be migrated once we have any migrated agents
+        environment_entry = {
+            "environment_servers": {
+                "legacy_agent": {
+                    "entrypoint": "app.py",
+                    "agent_server": {"type": "responses_api_agents", "name": composition.agent_instance},
+                }
+            }
+        }
+    config[composition.environment_instance] = environment_entry
     if composition.rollout_driver:
         config["rollout_collection_driver"] = composition.rollout_driver
 
@@ -490,24 +551,14 @@ def _standalone_resources_server_config(module_name: str) -> str:
     return dedent(
         f"""\
         # Resources server: owns this environment's task verification (verify()) and reward.
+        # Datasets are declared here — the resources server defines what the rows mean and how
+        # they are scored. Which agent runs them is chosen at run time.
         {module_name}_resources_server:          # instance name — how agents/CLI refer to this server
           resources_servers:                    # server type: resources_servers | responses_api_agents | responses_api_models
             {module_name}:                      # implementation directory under resources_servers/
               entrypoint: app.py                # server entry module
               domain: other                     # task domain; change to the closest supported domain
               verified: false                   # set true once the benchmark has been baselined and reviewed
-
-        # Pair the server with the default agent and dataset slots.
-        {module_name}_simple_agent:             # pass this instance as --agent to gym eval run
-          responses_api_agents:
-            simple_agent:
-              entrypoint: app.py
-              resources_server:
-                type: resources_servers
-                name: {module_name}_resources_server
-              model_server:
-                type: responses_api_models
-                name: policy_model
               datasets:
               - name: train
                 type: train
@@ -524,6 +575,27 @@ def _standalone_resources_server_config(module_name: str) -> str:
                 type: example
                 jsonl_fpath: resources_servers/{module_name}/data/example.jsonl
                 num_repeats: 1
+
+        # Pair the server with the default agent.
+        {module_name}_simple_agent:             # pass this instance as --agent to gym eval run
+          responses_api_agents:
+            simple_agent:
+              entrypoint: app.py
+              resources_server:
+                type: resources_servers
+                name: {module_name}_resources_server
+              model_server:
+                type: responses_api_models
+                name: policy_model
+
+        # Expose the agent through an environment server for rollout collection.
+        {module_name}_environment_server:
+          environment_servers:
+            legacy_agent:
+              entrypoint: app.py
+              agent_server:
+                type: responses_api_agents
+                name: {module_name}_simple_agent
         """
     )
 
@@ -551,9 +623,8 @@ def _standalone_data_gitignore() -> str:
         """\
         *train.jsonl
         *validation.jsonl
-        *train_prepare.jsonl
-        *validation_prepare.jsonl
-        *example_prepare.jsonl
+        *_prepare.jsonl
+        *_prepare.*.jsonl
         """
     )
 
@@ -827,6 +898,7 @@ def _resolve_reused_verifier(root: Path, selector: str) -> _ReusedVerifier:
     if len(agents) > 1 or (agents and agents[0][1] != "simple_agent"):
         raise ScaffoldError(f"reused verifier {selector!r} config may bundle only one simple_agent")
     agent_instance = None
+    environment_server = None
     if agents:
         agent_instance, _agent_implementation, agent_config = agents[0]
         resource_ref = agent_config.get("resources_server")
@@ -834,7 +906,63 @@ def _resolve_reused_verifier(root: Path, selector: str) -> _ReusedVerifier:
             raise ScaffoldError(
                 f"reused verifier {selector!r} simple_agent must reference resources instance {resource_instance!r}"
             )
-    return _ReusedVerifier(selector, config_reference, resource_instance, agent_instance)
+        environment_server = _reused_environment_server(raw, selector, agent_instance)
+    return _ReusedVerifier(selector, config_reference, resource_instance, agent_instance, environment_server)
+
+
+def _agent_reference_fields(server_config: Mapping[str, Any], agent_instance: str) -> tuple[str, ...]:
+    """Fields of an environment-server config that reference ``agent_instance``.
+
+    ``agent_server`` may leave its type out; any other field references an agent only when typed as one.
+    """
+    fields = []
+    for field, value in server_config.items():
+        if not isinstance(value, Mapping) or value.get("name") != agent_instance:
+            continue
+        default_type = "responses_api_agents" if field == "agent_server" else None
+        if value.get("type", default_type) == "responses_api_agents":
+            fields.append(str(field))
+    return tuple(fields)
+
+
+def _reused_environment_server(
+    raw: Mapping[str, Any], selector: str, agent_instance: str
+) -> _ReusedEnvironmentServer | None:
+    """The environment server in a reused config that fronts its bundled agent, if any.
+
+    The workload inherits this server under its own name, so only a server that can be inherited that way
+    is accepted.
+    """
+    fronting = [
+        _ReusedEnvironmentServer(instance, implementation, fields)
+        for instance, implementation, server_config in _server_entries(raw, "environment_servers")
+        if (fields := _agent_reference_fields(server_config, agent_instance))
+    ]
+    if not fronting:
+        return None
+    manual = "; compose the workload config by hand instead of using --reuse-verifier"
+    if len(fronting) > 1:
+        names = ", ".join(sorted(server.instance for server in fronting))
+        raise ScaffoldError(
+            f"reused verifier {selector!r} simple_agent must be fronted by at most one environment server, "
+            f"found: {names}{manual}"
+        )
+    server = fronting[0]
+    # Gym resolves `_inherit_from` against the configs as written, so inheriting a server that is itself
+    # inherited or copied would leave its own source unresolved.
+    if raw[server.instance].keys() & {"_inherit_from", "_copy"}:
+        raise ScaffoldError(
+            f"reused verifier {selector!r} environment server {server.instance!r} is itself derived with "
+            f"_inherit_from or _copy and cannot be inherited again{manual}"
+        )
+    # Inheriting retires the server's name, so a taskset route to that name would stop resolving.
+    routes = raw.get("environment_server_routes")
+    if isinstance(routes, Mapping) and server.instance in routes.values():
+        raise ScaffoldError(
+            f"reused verifier {selector!r} routes tasksets to environment server {server.instance!r}, "
+            f"which reuse would rename{manual}"
+        )
+    return server
 
 
 def _require_fixture_export(app_path: Path, selector: str) -> None:

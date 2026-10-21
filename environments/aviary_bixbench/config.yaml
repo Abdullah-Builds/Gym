@@ -1,6 +1,7 @@
 bixbench_aviary_resources_server:
   resources_servers:
     aviary:
+      allowed_agents: [aviary_agent]
       entrypoint: notebook_app.py
       domain: coding
       verified: false
@@ -18,3 +19,11 @@ bixbench_aviary_agent:
       - name: example
         type: example
         jsonl_fpath: environments/aviary_bixbench/data/example.jsonl
+
+bixbench_environment_server:
+  environment_servers:
+    legacy_agent:
+      entrypoint: app.py
+      agent_server:
+        type: responses_api_agents
+        name: bixbench_aviary_agent

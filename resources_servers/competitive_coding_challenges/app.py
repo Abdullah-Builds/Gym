@@ -85,10 +85,15 @@ class CompetitiveCodingChallengesResourcesServerConfig(BaseResourcesServerConfig
     num_parallel_requests: int = 16
     time_scale: float = 2.0
     shared_dir: str = "/tmp"
+    local_compile_dir: Optional[str] = "/tmp/nemo-gym-compile"
     reward_mode: Literal["binary", "fraction"] = "binary"
 
 
 class CompetitiveCodingChallengesResourcesServer(SimpleResourcesServer):
+    # Each submission is evaluated on its own: there is no session state to export,
+    # and a checkpoint can re-run a verification after a crash instead of waiting for it.
+    checkpoint_mode = "stateless"
+    checkpoint_verify = "replay"
     config: CompetitiveCodingChallengesResourcesServerConfig
 
     _evaluator: Optional[CCCEvaluator] = PrivateAttr(default=None)
@@ -276,6 +281,12 @@ class CompetitiveCodingChallengesResourcesServer(SimpleResourcesServer):
     def setup_webserver(self) -> FastAPI:
         app = super().setup_webserver()
 
+        if os.path.abspath(self.config.shared_dir) == "/tmp":
+            LOG.warning(
+                "CCC shared_dir is /tmp. If the resources server and sandbox run in separate containers, "
+                "/tmp may not be visible to both. Set CCC_SHARED_TEMP_DIR to a path mounted into both containers."
+            )
+
         print(
             f"Initializing CompetitiveCodingChallenges evaluator with config: {self.config.model_dump_json(indent=2)}"
         )
@@ -288,6 +299,7 @@ class CompetitiveCodingChallengesResourcesServer(SimpleResourcesServer):
                 "test_batch_size": self.config.test_batch_size,
                 "time_scale": self.config.time_scale,
                 "shared_dir": self.config.shared_dir,
+                "local_compile_dir": self.config.local_compile_dir,
                 "run_all_tests": self.config.reward_mode == "fraction",
             },
             num_parallel_requests=self.config.num_parallel_requests,

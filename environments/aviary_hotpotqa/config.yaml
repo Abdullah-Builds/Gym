@@ -1,6 +1,7 @@
 hotpotqa_aviary_resources_server:
   resources_servers:
     aviary:
+      allowed_agents: [aviary_agent]
       entrypoint: hotpotqa_app.py
       domain: agent
       verified: false
@@ -28,3 +29,11 @@ hotpotqa_aviary_agent:
       - name: example
         type: example
         jsonl_fpath: environments/aviary_hotpotqa/data/example.jsonl
+
+hotpotqa_environment_server:
+  environment_servers:
+    legacy_agent:
+      entrypoint: app.py
+      agent_server:
+        type: responses_api_agents
+        name: hotpotqa_aviary_agent
